@@ -1,0 +1,1167 @@
+import { OrbitControls, Stars } from "@react-three/drei";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
+import {
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import * as THREE from "three";
+
+export interface WeatherPoint {
+  lat: number;
+  lon: number;
+  temp: number;
+  windspeed: number;
+  weathercode: number;
+  city: string;
+}
+
+export interface FlightItem {
+  lat: number;
+  lon: number;
+  callsign: string;
+  icao24: string;
+  originCountry: string;
+  alt: number;
+  geoAlt: number;
+  vel: number;
+  hdg: number;
+  vertRate: number;
+  squawk: string;
+}
+
+export interface EqItem {
+  lat: number;
+  lng: number;
+  mag: number;
+  place: string;
+}
+
+export interface SatItem {
+  name: string;
+  lat: number;
+  lng: number;
+  alt: number;
+}
+
+interface GlobeViewProps {
+  flightData: FlightItem[];
+  eqData: EqItem[];
+  satData: SatItem[];
+  weatherData: WeatherPoint[];
+  layers: {
+    flights: boolean;
+    earthquakes: boolean;
+    satellites: boolean;
+    weather: boolean;
+  };
+  globeCenter: { lat: number; lng: number };
+  targetCenter?: { lat: number; lng: number } | null;
+  selectedSat: string | null;
+  onSatelliteClick: (name: string | null) => void;
+  onFlightClick: (f: FlightItem) => void;
+  onEarthquakeClick: (eq: EqItem) => void;
+  onCenterChange: (lat: number, lng: number) => void;
+  onZoomChange: (distance: number) => void;
+  cityData: Array<{ name: string; lat: number; lng: number }>;
+  onCityClick: (name: string, lat: number, lng: number) => void;
+  showLabels?: boolean;
+}
+
+// ─── Geo math helpers ─────────────────────────────────────────────────────────
+
+function latLngToVec3(
+  lat: number,
+  lng: number,
+  radius = 1,
+): [number, number, number] {
+  const phi = (90 - lat) * (Math.PI / 180);
+  const theta = (lng + 180) * (Math.PI / 180);
+  const x = -Math.sin(phi) * Math.cos(theta) * radius;
+  const z = Math.sin(phi) * Math.sin(theta) * radius;
+  const y = Math.cos(phi) * radius;
+  return [x, y, z];
+}
+
+function tile2lat(y: number, z: number): number {
+  const n = Math.PI - (2 * Math.PI * y) / 2 ** z;
+  return (180 / Math.PI) * Math.atan(Math.sinh(n));
+}
+
+function tile2lon(x: number, z: number): number {
+  return (x / 2 ** z) * 360 - 180;
+}
+
+function lat2tile(lat: number, z: number): number {
+  const latRad = (lat * Math.PI) / 180;
+  return Math.floor(
+    ((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) *
+      2 ** z,
+  );
+}
+
+function lon2tile(lon: number, z: number): number {
+  return Math.floor(((lon + 180) / 360) * 2 ** z);
+}
+
+function createTilePatchGeometry(
+  northLat: number,
+  southLat: number,
+  westLon: number,
+  eastLon: number,
+): THREE.BufferGeometry {
+  const segs = 12;
+  const positions: number[] = [];
+  const uvs: number[] = [];
+  const indices: number[] = [];
+
+  const mercNorth = Math.log(
+    Math.tan((northLat * Math.PI) / 180 / 2 + Math.PI / 4),
+  );
+  const mercSouth = Math.log(
+    Math.tan((southLat * Math.PI) / 180 / 2 + Math.PI / 4),
+  );
+
+  for (let i = 0; i <= segs; i++) {
+    for (let j = 0; j <= segs; j++) {
+      const lat = northLat + (southLat - northLat) * (i / segs);
+      const lon = westLon + (eastLon - westLon) * (j / segs);
+      const [x, y, z] = latLngToVec3(lat, lon, 1.001);
+      positions.push(x, y, z);
+
+      const u = j / segs;
+      const mercLat = Math.log(
+        Math.tan((lat * Math.PI) / 180 / 2 + Math.PI / 4),
+      );
+      const v = (mercLat - mercSouth) / (mercNorth - mercSouth);
+      uvs.push(u, v);
+    }
+  }
+
+  for (let i = 0; i < segs; i++) {
+    for (let j = 0; j < segs; j++) {
+      const a = i * (segs + 1) + j;
+      const b = a + segs + 1;
+      indices.push(a, b, a + 1);
+      indices.push(b, b + 1, a + 1);
+    }
+  }
+
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geom.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+  geom.setIndex(indices);
+  geom.computeVertexNormals();
+  return geom;
+}
+
+// ─── Tiled Globe Component ─────────────────────────────────────────────────────
+
+const BASE_ZOOM = 2; // 4x4 = 16 tiles, covers entire globe — NEVER removed
+const MAX_TILE_CACHE = 400;
+const MAX_TILE_RADIUS = 10;
+
+function disposeTile(mesh: THREE.Mesh, group: THREE.Group) {
+  mesh.geometry.dispose();
+  (mesh.material as THREE.MeshBasicMaterial).map?.dispose();
+  (mesh.material as THREE.MeshBasicMaterial).dispose();
+  group.remove(mesh);
+}
+
+function TiledGlobe() {
+  const groupRef = useRef<THREE.Group>(null!);
+  // Map from key `z/tx/ty` to mesh or 'loading'
+  const tilesRef = useRef<Map<string, THREE.Mesh | "loading">>(new Map());
+  // Which keys are base tiles (z=BASE_ZOOM) — never pruned
+  const baseTileKeysRef = useRef<Set<string>>(new Set());
+  const baseTilesLoadedRef = useRef(false);
+  const frameCountRef = useRef(0);
+  const currentDetailZoomRef = useRef(-1);
+  // Per-zoom generation counters to cancel stale in-flight loads
+  const zoomGenRef = useRef<Map<number, number>>(new Map());
+  const cleanupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const textureLoader = useRef(new THREE.TextureLoader());
+  const { camera } = useThree();
+
+  const getTileUrl = useCallback((z: number, x: number, y: number): string => {
+    return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
+  }, []);
+
+  const getZoomGen = useCallback((z: number): number => {
+    return zoomGenRef.current.get(z) ?? 0;
+  }, []);
+
+  const bumpZoomGen = useCallback((z: number): number => {
+    const next = (zoomGenRef.current.get(z) ?? 0) + 1;
+    zoomGenRef.current.set(z, next);
+    return next;
+  }, []);
+
+  const loadTile = useCallback(
+    (tileZ: number, tx: number, ty: number) => {
+      const key = `${tileZ}/${tx}/${ty}`;
+      if (tilesRef.current.has(key)) return;
+      tilesRef.current.set(key, "loading");
+
+      const northLat = tile2lat(ty, tileZ);
+      const southLat = tile2lat(ty + 1, tileZ);
+      const westLon = tile2lon(tx, tileZ);
+      const eastLon = tile2lon(tx + 1, tileZ);
+      const url = getTileUrl(tileZ, tx, ty);
+      const capturedGen = getZoomGen(tileZ);
+      const capturedKey = key;
+      const capturedZ = tileZ;
+
+      textureLoader.current.load(
+        url,
+        (texture) => {
+          // Stale check — if generation changed for this zoom, discard
+          if (getZoomGen(capturedZ) !== capturedGen) {
+            texture.dispose();
+            tilesRef.current.delete(capturedKey);
+            return;
+          }
+          texture.colorSpace = THREE.SRGBColorSpace;
+          const geom = createTilePatchGeometry(
+            northLat,
+            southLat,
+            westLon,
+            eastLon,
+          );
+          // Polygon offset: higher zoom tiles float above lower zoom ones
+          // Factor/units negative = closer to viewer (rendered on top)
+          const offset = capturedZ - 1;
+          const mat = new THREE.MeshBasicMaterial({
+            map: texture,
+            transparent: false,
+            depthWrite: true,
+            polygonOffset: true,
+            polygonOffsetFactor: -offset,
+            polygonOffsetUnits: -offset,
+          });
+          const mesh = new THREE.Mesh(geom, mat);
+          // Higher zoom renders on top via renderOrder
+          mesh.renderOrder = capturedZ;
+          tilesRef.current.set(capturedKey, mesh);
+          if (groupRef.current) {
+            groupRef.current.add(mesh);
+          }
+        },
+        undefined,
+        () => {
+          // On error just remove loading state
+          tilesRef.current.delete(capturedKey);
+        },
+      );
+    },
+    [getTileUrl, getZoomGen],
+  );
+
+  // Load the full-globe base layer (z=BASE_ZOOM = 16 tiles) once on mount
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentionally mount-only, loadTile is stable
+  useEffect(() => {
+    if (baseTilesLoadedRef.current) return;
+    baseTilesLoadedRef.current = true;
+    const maxTiles = 2 ** BASE_ZOOM; // 4
+    for (let ty = 0; ty < maxTiles; ty++) {
+      for (let tx = 0; tx < maxTiles; tx++) {
+        const key = `${BASE_ZOOM}/${tx}/${ty}`;
+        baseTileKeysRef.current.add(key);
+        loadTile(BASE_ZOOM, tx, ty);
+      }
+    }
+  }, []);
+
+  // Cleanup on unmount — dispose everything
+  const destroyAll = useCallback(() => {
+    for (const [, mesh] of tilesRef.current.entries()) {
+      if (mesh instanceof THREE.Mesh && groupRef.current) {
+        disposeTile(mesh, groupRef.current);
+      }
+    }
+    tilesRef.current.clear();
+    baseTileKeysRef.current.clear();
+  }, []);
+
+  useEffect(() => () => destroyAll(), [destroyAll]);
+
+  useFrame(() => {
+    frameCountRef.current++;
+    if (frameCountRef.current % 10 !== 0) return;
+    if (!groupRef.current) return;
+
+    const dist = camera.position.length();
+
+    // Desired detail zoom from camera distance
+    let desiredDetail: number;
+    if (dist <= 1.3) desiredDetail = 7;
+    else if (dist <= 1.5) desiredDetail = 6;
+    else if (dist <= 1.8) desiredDetail = 5;
+    else if (dist <= 2.2) desiredDetail = 4;
+    else if (dist <= 2.8) desiredDetail = 3;
+    else desiredDetail = BASE_ZOOM; // use base only
+
+    // Handle zoom level change
+    if (desiredDetail !== currentDetailZoomRef.current) {
+      const oldDetailZoom = currentDetailZoomRef.current;
+
+      // Cancel pending loads for the old detail zoom
+      if (oldDetailZoom > 0 && oldDetailZoom !== BASE_ZOOM) {
+        bumpZoomGen(oldDetailZoom);
+      }
+
+      currentDetailZoomRef.current = desiredDetail;
+
+      // Clear any previous pending cleanup
+      if (cleanupTimerRef.current !== null) {
+        clearTimeout(cleanupTimerRef.current);
+        cleanupTimerRef.current = null;
+      }
+
+      // Schedule delayed cleanup of old zoom tiles (not base)
+      if (oldDetailZoom > BASE_ZOOM) {
+        const zoomToClean = oldDetailZoom;
+        cleanupTimerRef.current = setTimeout(() => {
+          cleanupTimerRef.current = null;
+          if (!groupRef.current) return;
+          const prefix = `${zoomToClean}/`;
+          for (const [key, mesh] of Array.from(tilesRef.current.entries())) {
+            if (key.startsWith(prefix)) {
+              if (mesh instanceof THREE.Mesh) {
+                disposeTile(mesh, groupRef.current!);
+              }
+              tilesRef.current.delete(key);
+            }
+          }
+        }, 3000);
+      }
+    }
+
+    // Load detail tiles if above base zoom
+    const activeZ = currentDetailZoomRef.current;
+    if (activeZ > BASE_ZOOM) {
+      const camDir = camera.position.clone().normalize();
+      const lat =
+        90 - Math.acos(Math.max(-1, Math.min(1, camDir.y))) * (180 / Math.PI);
+      const lng = Math.atan2(camDir.z, -camDir.x) * (180 / Math.PI) - 180;
+
+      const centerTileX = lon2tile(lng, activeZ);
+      const centerTileY = lat2tile(lat, activeZ);
+      const maxTiles = 2 ** activeZ;
+
+      const halfAngleDeg = Math.asin(Math.min(1, 1 / dist)) * (180 / Math.PI);
+      const tileDegSize = 360 / maxTiles;
+      const isPolarView = Math.abs(lat) > 70;
+      const tileRadius = Math.min(
+        MAX_TILE_RADIUS,
+        Math.ceil(halfAngleDeg / tileDegSize) + (isPolarView ? 3 : 1),
+      );
+
+      // Normal tile radius sweep
+      for (let dy = -tileRadius; dy <= tileRadius; dy++) {
+        for (let dx = -tileRadius; dx <= tileRadius; dx++) {
+          const tx = (((centerTileX + dx) % maxTiles) + maxTiles) % maxTiles;
+          const ty = centerTileY + dy;
+          if (ty < 0 || ty >= maxTiles) continue;
+          loadTile(activeZ, tx, ty);
+        }
+      }
+
+      // Polar view: also load all tiles in the top/bottom rows to avoid holes
+      // when camDir.y ≈ ±1 makes longitude undefined
+      if (isPolarView) {
+        if (lat > 70) {
+          // Near north pole — load full top two tile rows
+          for (let tx = 0; tx < maxTiles; tx++) {
+            loadTile(activeZ, tx, 0);
+            if (maxTiles > 1) loadTile(activeZ, tx, 1);
+          }
+        } else {
+          // Near south pole — load full bottom two tile rows
+          for (let tx = 0; tx < maxTiles; tx++) {
+            loadTile(activeZ, tx, maxTiles - 1);
+            if (maxTiles > 1) loadTile(activeZ, tx, maxTiles - 2);
+          }
+        }
+      }
+    }
+
+    // Prune cache when over limit — never remove base tiles or current detail zoom
+    if (tilesRef.current.size > MAX_TILE_CACHE) {
+      let pruned = 0;
+      for (const [key, mesh] of Array.from(tilesRef.current.entries())) {
+        const isBase = baseTileKeysRef.current.has(key);
+        const keyZ = Number.parseInt(key.split("/")[0], 10);
+        const isCurrentDetail = keyZ === currentDetailZoomRef.current;
+        if (!isBase && !isCurrentDetail && mesh instanceof THREE.Mesh) {
+          disposeTile(mesh, groupRef.current);
+          tilesRef.current.delete(key);
+          pruned++;
+          if (pruned >= 30) break;
+        }
+      }
+    }
+  });
+
+  return (
+    <>
+      {/* Base sphere — slightly lighter blue-grey so poles look better */}
+      <mesh>
+        <sphereGeometry args={[0.998, 48, 48]} />
+        <meshBasicMaterial color="#1a3050" />
+      </mesh>
+
+      {/* Polar caps — cover the ~85°–90° lat range not served by Web Mercator tiles */}
+      {/* North pole cap: thetaLength 0.262 rad ≈ 15° arc from top, covers above ~75° lat */}
+      <mesh>
+        <sphereGeometry args={[1.0002, 32, 16, 0, Math.PI * 2, 0, 0.262]} />
+        <meshBasicMaterial
+          color="#002750"
+          transparent
+          opacity={0.82}
+          depthWrite={false}
+        />
+      </mesh>
+      {/* South pole cap: same geometry, flipped 180° on X axis */}
+      <mesh rotation={[Math.PI, 0, 0]}>
+        <sphereGeometry args={[1.0002, 32, 16, 0, Math.PI * 2, 0, 0.262]} />
+        <meshBasicMaterial color="#ddeeff" />
+      </mesh>
+
+      <group ref={groupRef} />
+    </>
+  );
+}
+
+// ─── Flight helpers ───────────────────────────────────────────────────────────
+
+function getFlightQuaternion(
+  lat: number,
+  lng: number,
+  hdg: number,
+): THREE.Quaternion {
+  const latR = lat * (Math.PI / 180);
+  const thetaR = (lng + 180) * (Math.PI / 180);
+  const hdgR = hdg * (Math.PI / 180);
+
+  const north = new THREE.Vector3(
+    Math.sin(latR) * Math.cos(thetaR),
+    Math.cos(latR),
+    -Math.sin(latR) * Math.sin(thetaR),
+  ).normalize();
+
+  const east = new THREE.Vector3(
+    Math.sin(thetaR),
+    0,
+    Math.cos(thetaR),
+  ).normalize();
+
+  const headingDir = new THREE.Vector3()
+    .addScaledVector(north, Math.cos(hdgR))
+    .addScaledVector(east, Math.sin(hdgR))
+    .normalize();
+
+  const [nx, ny, nz] = latLngToVec3(lat, lng, 1);
+  const surfaceNormal = new THREE.Vector3(nx, ny, nz).normalize();
+
+  const mat = new THREE.Matrix4();
+  const right = new THREE.Vector3()
+    .crossVectors(headingDir, surfaceNormal)
+    .normalize();
+  mat.makeBasis(right, headingDir, surfaceNormal);
+  return new THREE.Quaternion().setFromRotationMatrix(mat);
+}
+
+function createAirplaneGeometry(): THREE.ShapeGeometry {
+  const s = 0.009;
+  const shape = new THREE.Shape();
+  shape.moveTo(0, s * 0.9);
+  shape.lineTo(s * 0.09, s * 0.25);
+  shape.lineTo(s * 0.55, -s * 0.15);
+  shape.lineTo(s * 0.52, -s * 0.28);
+  shape.lineTo(s * 0.09, -s * 0.12);
+  shape.lineTo(s * 0.22, -s * 0.82);
+  shape.lineTo(s * 0.2, -s * 0.88);
+  shape.lineTo(0, -s * 0.72);
+  shape.lineTo(-s * 0.2, -s * 0.88);
+  shape.lineTo(-s * 0.22, -s * 0.82);
+  shape.lineTo(-s * 0.09, -s * 0.12);
+  shape.lineTo(-s * 0.52, -s * 0.28);
+  shape.lineTo(-s * 0.55, -s * 0.15);
+  shape.lineTo(-s * 0.09, s * 0.25);
+  shape.lineTo(0, s * 0.9);
+  return new THREE.ShapeGeometry(shape);
+}
+
+function FlightTail({
+  lat,
+  lon,
+  hdg,
+  altRadius,
+}: { lat: number; lon: number; hdg: number; altRadius: number }) {
+  const geom = useMemo(() => {
+    const backHdg = hdg + 180;
+    const backHdgR = backHdg * (Math.PI / 180);
+    const latR = lat * (Math.PI / 180);
+    const thetaR = (lon + 180) * (Math.PI / 180);
+
+    const north = new THREE.Vector3(
+      Math.sin(latR) * Math.cos(thetaR),
+      Math.cos(latR),
+      -Math.sin(latR) * Math.sin(thetaR),
+    ).normalize();
+    const east = new THREE.Vector3(
+      Math.sin(thetaR),
+      0,
+      Math.cos(thetaR),
+    ).normalize();
+
+    const backDir = new THREE.Vector3()
+      .addScaledVector(north, Math.cos(backHdgR))
+      .addScaledVector(east, Math.sin(backHdgR))
+      .normalize();
+
+    const origin = new THREE.Vector3(...latLngToVec3(lat, lon, altRadius));
+    const N = 12;
+    const points: THREE.Vector3[] = [];
+    for (let i = 0; i <= N; i++) {
+      const t = i / N;
+      const angle = t * 0.045;
+      const rotAxis = new THREE.Vector3()
+        .crossVectors(origin.clone().normalize(), backDir)
+        .normalize();
+      const dir = origin
+        .clone()
+        .normalize()
+        .applyAxisAngle(rotAxis, angle)
+        .multiplyScalar(altRadius);
+      points.push(dir);
+    }
+    return new THREE.BufferGeometry().setFromPoints(points);
+  }, [lat, lon, hdg, altRadius]);
+
+  const mat = useMemo(() => {
+    return new THREE.LineBasicMaterial({
+      color: "#00ffff",
+      opacity: 0.55,
+      transparent: true,
+    });
+  }, []);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: geometry recreated on changes
+  useEffect(
+    () => () => {
+      geom.dispose();
+      mat.dispose();
+    },
+    [],
+  );
+
+  return <primitive object={new THREE.Line(geom, mat)} />;
+}
+
+function FlightLabel({
+  callsign,
+  position,
+}: { callsign: string; position: [number, number, number] }) {
+  const texture = useMemo(() => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 128;
+    canvas.height = 28;
+    const ctx = canvas.getContext("2d")!;
+    ctx.clearRect(0, 0, 128, 28);
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
+    ctx.fillRect(0, 0, 128, 28);
+    ctx.fillStyle = "#00ffff";
+    ctx.font = "bold 13px monospace";
+    ctx.fillText(callsign.slice(0, 9), 4, 20);
+    return new THREE.CanvasTexture(canvas);
+  }, [callsign]);
+
+  useEffect(() => () => texture.dispose(), [texture]);
+
+  const [x, y, z] = position;
+  const n = new THREE.Vector3(x, y, z).normalize().multiplyScalar(0.018);
+  const pos: [number, number, number] = [x + n.x, y + n.y, z + n.z];
+
+  return (
+    <sprite position={pos} scale={[0.055, 0.012, 1]}>
+      <spriteMaterial
+        map={texture}
+        transparent
+        depthWrite={false}
+        sizeAttenuation
+      />
+    </sprite>
+  );
+}
+
+function SatelliteSprite({ isSelected }: { isSelected: boolean }) {
+  const texture = useMemo(() => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 64;
+    canvas.height = 64;
+    const ctx = canvas.getContext("2d")!;
+    ctx.clearRect(0, 0, 64, 64);
+    const color = isSelected ? "#ffff00" : "#ff8800";
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.fillStyle = `${color}33`;
+    // Main body rectangle
+    ctx.fillRect(24, 22, 16, 20);
+    ctx.strokeRect(24, 22, 16, 20);
+    // Solar panels left
+    ctx.fillStyle = "#4488ff44";
+    ctx.fillRect(4, 26, 18, 12);
+    ctx.strokeRect(4, 26, 18, 12);
+    ctx.strokeStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(10, 26);
+    ctx.lineTo(10, 38);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(16, 26);
+    ctx.lineTo(16, 38);
+    ctx.stroke();
+    // Solar panels right
+    ctx.fillStyle = "#4488ff44";
+    ctx.fillRect(42, 26, 18, 12);
+    ctx.strokeRect(42, 26, 18, 12);
+    ctx.strokeStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(48, 26);
+    ctx.lineTo(48, 38);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(54, 26);
+    ctx.lineTo(54, 38);
+    ctx.stroke();
+    // Antenna
+    ctx.beginPath();
+    ctx.moveTo(32, 22);
+    ctx.lineTo(32, 10);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(32, 8, 4, 0, Math.PI * 2);
+    ctx.stroke();
+    if (isSelected) {
+      ctx.shadowColor = "#ffff00";
+      ctx.shadowBlur = 12;
+      ctx.strokeStyle = "#ffff0088";
+      ctx.strokeRect(22, 20, 20, 24);
+    }
+    return new THREE.CanvasTexture(canvas);
+  }, [isSelected]);
+
+  useEffect(() => () => texture.dispose(), [texture]);
+  const scale = isSelected ? 0.055 : 0.038;
+  return (
+    <sprite scale={[scale, scale, 1]}>
+      <spriteMaterial
+        map={texture}
+        transparent
+        depthWrite={false}
+        sizeAttenuation
+      />
+    </sprite>
+  );
+}
+
+function CityMarker({
+  name,
+  lat,
+  lng,
+  onClick,
+  visible,
+}: {
+  name: string;
+  lat: number;
+  lng: number;
+  onClick: () => void;
+  visible: boolean;
+}) {
+  const [x, y, z] = latLngToVec3(lat, lng, 1.018);
+
+  const labelTexture = useMemo(() => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 160;
+    canvas.height = 32;
+    const ctx = canvas.getContext("2d")!;
+    ctx.clearRect(0, 0, 160, 32);
+    ctx.fillStyle = "rgba(0,0,0,0.7)";
+    ctx.roundRect(0, 0, 160, 32, 4);
+    ctx.fill();
+    ctx.fillStyle = "#00ffcc";
+    ctx.font = "bold 14px monospace";
+    ctx.fillText(name.toUpperCase(), 8, 22);
+    return new THREE.CanvasTexture(canvas);
+  }, [name]);
+
+  useEffect(() => () => labelTexture.dispose(), [labelTexture]);
+
+  const pinTexture = useMemo(() => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 32;
+    canvas.height = 32;
+    const ctx = canvas.getContext("2d")!;
+    ctx.clearRect(0, 0, 32, 32);
+    ctx.strokeStyle = "#00ffcc";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(16, 16, 10, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.fillStyle = "#00ffcc";
+    ctx.beginPath();
+    ctx.arc(16, 16, 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(16, 4);
+    ctx.lineTo(16, 12);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(16, 20);
+    ctx.lineTo(16, 28);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(4, 16);
+    ctx.lineTo(12, 16);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(20, 16);
+    ctx.lineTo(28, 16);
+    ctx.stroke();
+    return new THREE.CanvasTexture(canvas);
+  }, []);
+
+  useEffect(() => () => pinTexture.dispose(), [pinTexture]);
+
+  const norm = new THREE.Vector3(x, y, z).normalize();
+  const labelOffset = norm.clone().multiplyScalar(0.04);
+  const labelPos: [number, number, number] = [
+    x + labelOffset.x,
+    y + labelOffset.y,
+    z + labelOffset.z,
+  ];
+
+  return (
+    <group>
+      <sprite position={[x, y, z]} scale={[0.03, 0.03, 1]}>
+        <spriteMaterial
+          map={pinTexture}
+          transparent
+          depthWrite={false}
+          sizeAttenuation
+        />
+      </sprite>
+      {/* biome-ignore lint/a11y/useKeyWithClickEvents: Three.js mesh */}
+      <mesh
+        position={[x, y, z]}
+        onClick={(e) => {
+          e.stopPropagation();
+          onClick();
+        }}
+      >
+        <sphereGeometry args={[0.022, 6, 6]} />
+        <meshBasicMaterial transparent opacity={0} depthWrite={false} />
+      </mesh>
+      {visible && (
+        <sprite position={labelPos} scale={[0.07, 0.014, 1]}>
+          <spriteMaterial
+            map={labelTexture}
+            transparent
+            depthWrite={false}
+            sizeAttenuation
+          />
+        </sprite>
+      )}
+    </group>
+  );
+}
+
+function WeatherMarker({ point }: { point: WeatherPoint }) {
+  const [x, y, z] = latLngToVec3(point.lat, point.lon, 1.003);
+  const temp = point.temp;
+  const color =
+    temp < 0
+      ? "#4488ff"
+      : temp < 15
+        ? "#00ffcc"
+        : temp < 25
+          ? "#ffff00"
+          : "#ff4400";
+  return (
+    <mesh position={[x, y, z]}>
+      <sphereGeometry args={[0.005, 6, 6]} />
+      <meshBasicMaterial color={color} transparent opacity={0.85} />
+    </mesh>
+  );
+}
+
+// ─── Earth component ───────────────────────────────────────────────────────────
+
+interface EarthProps extends Omit<GlobeViewProps, "globeCenter"> {
+  initCenter: { lat: number; lng: number };
+  cameraDistRef: React.MutableRefObject<number>;
+}
+
+function Earth({
+  flightData,
+  eqData,
+  satData,
+  weatherData,
+  layers,
+  selectedSat,
+  onSatelliteClick,
+  onFlightClick,
+  onEarthquakeClick,
+  onCenterChange,
+  onZoomChange,
+  cityData,
+  onCityClick,
+  initCenter,
+  targetCenter,
+  cameraDistRef,
+  showLabels: showLabelsProp = true,
+}: EarthProps) {
+  const { camera } = useThree();
+  const airplaneGeom = useMemo(() => createAirplaneGeometry(), []);
+  const animTargetRef = useRef<THREE.Vector3 | null>(null);
+  const prevTargetRef = useRef<{ lat: number; lng: number } | null>(null);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: mount-only camera init
+  useEffect(() => {
+    const [x, y, z] = latLngToVec3(initCenter.lat, initCenter.lng, 2.5);
+    camera.position.set(x, y, z);
+    camera.lookAt(0, 0, 0);
+  }, []);
+
+  useEffect(() => {
+    if (!targetCenter) return;
+    if (
+      prevTargetRef.current?.lat === targetCenter.lat &&
+      prevTargetRef.current?.lng === targetCenter.lng
+    )
+      return;
+    prevTargetRef.current = { ...targetCenter };
+    const targetDist = 1.35;
+    const [tx, ty, tz] = latLngToVec3(
+      targetCenter.lat,
+      targetCenter.lng,
+      targetDist,
+    );
+    animTargetRef.current = new THREE.Vector3(tx, ty, tz);
+  }, [targetCenter]);
+
+  useFrame(() => {
+    if (animTargetRef.current) {
+      camera.position.lerp(animTargetRef.current, 0.06);
+      if (camera.position.distanceTo(animTargetRef.current) < 0.003) {
+        camera.position.copy(animTargetRef.current);
+        animTargetRef.current = null;
+      }
+    }
+
+    camera.lookAt(0, 0, 0);
+    const dist = camera.position.length();
+    cameraDistRef.current = dist;
+    onZoomChange(dist);
+
+    const dir = camera.position.clone().normalize();
+    const lat =
+      90 - Math.acos(Math.max(-1, Math.min(1, dir.y))) * (180 / Math.PI);
+    const lng = Math.atan2(dir.z, -dir.x) * (180 / Math.PI) - 180;
+    onCenterChange(lat, lng);
+  });
+
+  const cameraDist = cameraDistRef.current;
+  const showLabels = showLabelsProp && cameraDist < 1.7;
+
+  return (
+    <>
+      <TiledGlobe />
+
+      {/* Atmosphere glow */}
+      <mesh>
+        <sphereGeometry args={[1.01, 32, 32]} />
+        <meshBasicMaterial
+          color="#1a4a6e"
+          transparent
+          opacity={0.1}
+          blending={THREE.AdditiveBlending}
+          depthWrite={false}
+          side={THREE.FrontSide}
+        />
+      </mesh>
+      <mesh>
+        <sphereGeometry args={[1.05, 32, 32]} />
+        <meshBasicMaterial
+          color="#0a2a4e"
+          transparent
+          opacity={0.06}
+          blending={THREE.AdditiveBlending}
+          depthWrite={false}
+          side={THREE.BackSide}
+        />
+      </mesh>
+
+      {/* ── FLIGHTS ── */}
+      {layers.flights &&
+        flightData.slice(0, 300).map((f) => {
+          // Display flights at actual altitude — exaggerated 20x for visibility (earth radius ~6371km)
+          const altRadius = 1.001 + Math.max(0, f.alt / 6371000) * 20;
+          const [x, y, z] = latLngToVec3(f.lat, f.lon, altRadius);
+          const quat = getFlightQuaternion(f.lat, f.lon, f.hdg);
+          return (
+            <group key={`f-${f.callsign}-${f.lat.toFixed(2)}`}>
+              <FlightTail
+                lat={f.lat}
+                lon={f.lon}
+                hdg={f.hdg}
+                altRadius={altRadius}
+              />
+              {/* biome-ignore lint/a11y/useKeyWithClickEvents: Three.js mesh */}
+              <mesh
+                position={[x, y, z]}
+                quaternion={quat}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onFlightClick(f);
+                }}
+              >
+                <primitive object={airplaneGeom} attach="geometry" />
+                <meshBasicMaterial color="#00ffff" side={THREE.DoubleSide} />
+              </mesh>
+              {/* Larger invisible hit target */}
+              {/* biome-ignore lint/a11y/useKeyWithClickEvents: Three.js mesh */}
+              <mesh
+                position={[x, y, z]}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onFlightClick(f);
+                }}
+              >
+                <sphereGeometry args={[0.018, 6, 6]} />
+                <meshBasicMaterial transparent opacity={0} depthWrite={false} />
+              </mesh>
+              {showLabels && (
+                <FlightLabel callsign={f.callsign} position={[x, y, z]} />
+              )}
+            </group>
+          );
+        })}
+
+      {/* ── EARTHQUAKES ── */}
+      {layers.earthquakes &&
+        eqData.map((eq) => {
+          const [x, y, z] = latLngToVec3(eq.lat, eq.lng, 1.003);
+          const color =
+            eq.mag >= 5 ? "#ff3300" : eq.mag >= 3 ? "#ff6600" : "#ffcc00";
+          const size = Math.max(0.004, eq.mag * 0.004);
+          return (
+            <group key={`eq-${eq.lat}-${eq.lng}`}>
+              <mesh position={[x, y, z]}>
+                <sphereGeometry args={[size, 8, 8]} />
+                <meshBasicMaterial color={color} transparent opacity={0.45} />
+              </mesh>
+              {(() => {
+                const eqNorm = new THREE.Vector3(x, y, z).normalize();
+                const eqQuat = new THREE.Quaternion().setFromUnitVectors(
+                  new THREE.Vector3(0, 1, 0),
+                  eqNorm,
+                );
+                return (
+                  <mesh position={[x, y, z]} quaternion={eqQuat}>
+                    <torusGeometry args={[size * 2.2, size * 0.3, 8, 24]} />
+                    <meshBasicMaterial
+                      color={color}
+                      transparent
+                      opacity={0.2}
+                      depthWrite={false}
+                    />
+                  </mesh>
+                );
+              })()}
+              {/* biome-ignore lint/a11y/useKeyWithClickEvents: Three.js mesh */}
+              <mesh
+                position={[x, y, z]}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onEarthquakeClick(eq);
+                }}
+              >
+                <sphereGeometry args={[0.018, 6, 6]} />
+                <meshBasicMaterial transparent opacity={0} depthWrite={false} />
+              </mesh>
+            </group>
+          );
+        })}
+
+      {/* ── SATELLITES ── — only show when zoomed out enough */}
+      {layers.satellites &&
+        cameraDist >= 1.6 &&
+        satData.map((sat) => {
+          const altOffset =
+            1 + (Math.min(Math.max(sat.alt, 100), 40000) / 40000) ** 0.5;
+          const [x, y, z] = latLngToVec3(sat.lat, sat.lng, altOffset);
+          const isSelected = selectedSat === sat.name;
+          return (
+            <group key={`sat-${sat.name}`}>
+              <group position={[x, y, z]}>
+                <SatelliteSprite isSelected={isSelected} />
+                {/* biome-ignore lint/a11y/useKeyWithClickEvents: Three.js mesh */}
+                <mesh
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onSatelliteClick(isSelected ? null : sat.name);
+                  }}
+                >
+                  <sphereGeometry args={[0.028, 6, 6]} />
+                  <meshBasicMaterial
+                    transparent
+                    opacity={0}
+                    depthWrite={false}
+                  />
+                </mesh>
+              </group>
+              {isSelected &&
+                (() => {
+                  const satVec = new THREE.Vector3(
+                    ...latLngToVec3(sat.lat, sat.lng, 1),
+                  ).normalize();
+                  const refVec =
+                    Math.abs(satVec.y) < 0.95
+                      ? new THREE.Vector3(0, 1, 0)
+                      : new THREE.Vector3(1, 0, 0);
+                  const ringNormal = new THREE.Vector3()
+                    .crossVectors(satVec, refVec)
+                    .normalize();
+                  const orbitQuat = new THREE.Quaternion().setFromUnitVectors(
+                    new THREE.Vector3(0, 1, 0),
+                    ringNormal,
+                  );
+                  return (
+                    <mesh quaternion={orbitQuat}>
+                      <torusGeometry args={[altOffset, 0.004, 12, 128]} />
+                      <meshBasicMaterial
+                        color="#ffee00"
+                        transparent
+                        opacity={0.7}
+                        depthWrite={false}
+                        blending={THREE.AdditiveBlending}
+                      />
+                    </mesh>
+                  );
+                })()}
+            </group>
+          );
+        })}
+
+      {/* ── WEATHER ── */}
+      {layers.weather &&
+        weatherData.map((w) => <WeatherMarker key={`w-${w.city}`} point={w} />)}
+
+      {/* ── CITIES ── */}
+      {cityData.map((city) => (
+        <CityMarker
+          key={`city-${city.name}`}
+          name={city.name}
+          lat={city.lat}
+          lng={city.lng}
+          onClick={() => onCityClick(city.name, city.lat, city.lng)}
+          visible={showLabelsProp && cameraDist < 2.2}
+        />
+      ))}
+    </>
+  );
+}
+
+// ─── Globe Scene ───────────────────────────────────────────────────────────────
+
+function GlobeScene(
+  props: Omit<GlobeViewProps, "globeCenter"> & {
+    initCenter: { lat: number; lng: number };
+    cameraDistRef: React.MutableRefObject<number>;
+  },
+) {
+  return (
+    <>
+      <ambientLight intensity={0.5} />
+      <directionalLight position={[5, 3, 5]} intensity={1.0} />
+      <Stars
+        radius={300}
+        depth={50}
+        count={4000}
+        factor={4}
+        saturation={0}
+        fade
+        speed={0.3}
+      />
+      <Suspense fallback={null}>
+        <Earth {...props} />
+      </Suspense>
+      <OrbitControls
+        enablePan={false}
+        minDistance={1.15}
+        maxDistance={4.5}
+        rotateSpeed={0.45}
+        zoomSpeed={0.9}
+        autoRotate={false}
+      />
+    </>
+  );
+}
+
+// ─── Public export ─────────────────────────────────────────────────────────────
+
+export default function GlobeView(props: GlobeViewProps) {
+  const { globeCenter, ...rest } = props;
+  const [loaded, setLoaded] = useState(false);
+  const cameraDistRef = useRef(2.5);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setLoaded(true), 80);
+    return () => clearTimeout(timer);
+  }, []);
+
+  return (
+    <div style={{ width: "100%", height: "100%", position: "relative" }}>
+      {!loaded && (
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            color: "rgba(0,255,255,0.5)",
+            fontSize: 10,
+            fontFamily: "monospace",
+            letterSpacing: "0.15em",
+            background: "#050510",
+            zIndex: 10,
+          }}
+        >
+          INITIALIZING GLOBE...
+        </div>
+      )}
+      <Canvas
+        gl={{
+          antialias: true,
+          powerPreference: "high-performance",
+          alpha: false,
+        }}
+        camera={{ fov: 45, near: 0.01, far: 1000 }}
+        style={{ background: "#000008" }}
+      >
+        <GlobeScene
+          {...rest}
+          initCenter={globeCenter}
+          cameraDistRef={cameraDistRef}
+        />
+      </Canvas>
+    </div>
+  );
+}
